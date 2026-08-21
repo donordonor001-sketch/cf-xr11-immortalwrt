@@ -1,0 +1,80 @@
+name: Build ImmortalWrt for COMFAST CF-XR11
+
+on:
+  workflow_dispatch:
+
+env:
+  IMMORTALWRT_BRANCH: openwrt-24.10
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout this repo (device files)
+        uses: actions/checkout@v4
+
+      - name: Free disk space & install build deps
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools rsync unzip zlib1g-dev file wget swig time libelf-dev
+
+      - name: Clone ImmortalWrt
+        run: |
+          git clone --depth 1 -b "$IMMORTALWRT_BRANCH" https://github.com/immortalwrt/immortalwrt.git owrt
+
+      - name: Inject CF-XR11 device (dts + image recipe)
+        run: |
+          cp device/mt7621_comfast_cf-xr11.dts owrt/target/linux/ramips/dts/
+          cat device/comfast_cf-xr11.mk >> owrt/target/linux/ramips/image/mt7621.mk
+          for f in 02_network 01_leds; do
+            sed -i 's/comfast,cf-e390ax)/comfast,cf-xr11|comfast,cf-e390ax)/g' \
+              owrt/target/linux/ramips/base-files/etc/board.d/$f 2>/dev/null || true
+          done
+          echo "=== device block appended ==="; tail -n 15 owrt/target/linux/ramips/image/mt7621.mk
+
+      - name: Update & install feeds
+        run: |
+          cd owrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure (device + LuCI web UI)
+        run: |
+          cd owrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_comfast_cf-xr11=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-proto-ppp=y
+          CONFIG_PACKAGE_ppp=y
+          CONFIG_PACKAGE_ppp-mod-pppoe=y
+          EOF
+          make defconfig
+          echo "=== selected device ==="; grep -i 'cf-xr11\|CONFIG_TARGET_DEVICE' .config | head
+
+      - name: Download sources
+        run: cd owrt && make download -j8 V=s | grep -i -E 'error|failed' || true
+
+      - name: Build
+        run: |
+          cd owrt
+          make -j$(nproc) || make -j1 V=s
+
+      - name: List output
+        run: ls -l owrt/bin/targets/ramips/mt7621/ || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-xr11-immortalwrt
+          path: |
+            owrt/bin/targets/ramips/mt7621/*comfast_cf-xr11*factory.bin
+            owrt/bin/targets/ramips/mt7621/*comfast_cf-xr11*sysupgrade.bin
+            owrt/bin/targets/ramips/mt7621/*.manifest
+            owrt/bin/targets/ramips/mt7621/sha256sums
